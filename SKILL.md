@@ -182,6 +182,8 @@ for each skill in 优化范围:
 ```
 for each skill:
   round = 0
+  reverts_this_skill = 0          # P0 失败记忆：本 skill 已 revert 次数
+  session_blacklist = []          # P0 本 session 内已失败、禁止重试的方案
   while round < MAX_ROUNDS (默认3):
     round += 1
 
@@ -190,11 +192,24 @@ for each skill:
     # HL-3 警告：dim2/dim3/dim4 是相关簇，修一个时另两个常跟着涨
     # → 不要因为 dim3 最低就单独修，要看整簇短板再决定是否同步改
 
+    # P0 禁试清单：诊断前先读「失败记忆」，避免重提同一烂招
+    #   = grep results.tsv 中本 skill 所有 status=revert 行的 note（reject:/regress: 前缀）
+    #     + session_blacklist（本次运行内已失败的方案）
+    # → 若最低维只剩被禁方案，跳到次低维，或提议 Phase 2.5（不在禁试清单里硬磨）
+
+    # P1-3 双通道诊断：不只看「哪差补哪」，也要看「哪好别动」
+    #   从最近一次 full_test 读出：哪些 test-prompt 已跑赢 baseline(PASS) / 哪些没过(FAIL)
+    #   → 把「PASS 集」「≥9 分的维度」记为本轮"受保护项"，供 Step 2 / Step 5 用
+    #   注：dry_run 模式无真实 PASS/FAIL，双通道降级为提醒，并在 note 标注 dry_run
+
     # Step 2: 提出改进方案
-    针对最低维度，生成1个具体改进方案：
+    针对最低维度（或 P1-3 标记的失败 test-prompt），生成1个具体改进方案：
       - 改什么（具体段落/行）
       - 为什么改（对应rubric哪条）
       - 预期提升多少分
+      - 【P0】不得复用「禁试清单」里的方案；若唯一可行方案已在清单 →
+        不硬改，改提次低维或升级 Phase 2.5
+      - 【P1-3】表述为「修 {最低维/失败prompt}，且不得让 {PASS集/≥9分维度} 退步」
 
     # Step 3: 执行改进
     编辑 SKILL.md
@@ -205,7 +220,10 @@ for each skill:
     - 效果维度：spawn独立子agent重跑测试prompt（关键！不能自己评自己）
 
     # Step 5: 决策
-    if 新总分 > 旧总分:
+    # 【P1-3 回归护栏】仅 full_test 生效：本轮是否打坏了之前 PASS 的 test-prompt？
+    regressed = (eval_mode == full_test) and 存在「上轮 PASS、本轮 FAIL」的 test-prompt
+
+    if 新总分 > 旧总分 and not regressed:
       status = "keep"，更新旧总分
       # HL-4 见好就收：连续2轮 Δ < 2 分 → break 进 Phase 3
       if last_delta < 2.0 and this_delta < 2.0:
@@ -214,8 +232,18 @@ for each skill:
     else:
       status = "revert"
       git revert HEAD（创建新commit回滚，不用reset --hard）
-      记录失败尝试到 results.tsv
-      break  # 该skill到瓶颈，跳到下一个
+      # 【P0】把失败教训写进 results.tsv 的 note 列（复用现有列，不加列）
+      if regressed:
+        note = "regress:{失败prompt} via {方案摘要} 总分+{x}但实测退"
+      else:
+        note = "reject:{dimN} via {方案摘要≤15字} Δ-{x}"
+      results.tsv 追加 revert 行（note 如上）；把本方案加入 session_blacklist
+      reverts_this_skill += 1
+      # 【P0 用户决策：重试一次】带着失败记忆再诊断一次（不立刻弃疗）
+      if reverts_this_skill == 1 and round < MAX_ROUNDS:
+        continue   # 回 while → Step 1 读禁试清单避开刚失败的方案，换个角度再试
+      else:
+        break      # 第2次 revert 或已到轮上限 → 该skill到瓶颈，跳到下一个
 
     # Step 6: 日志
     results.tsv 追加行
@@ -280,10 +308,16 @@ for each skill:
 timestamp	commit	skill	old_score	new_score	status	dimension	note	eval_mode
 2026-03-31T10:00	baseline	huashu-proofreading	-	78	baseline	-	初始评估	full_test
 2026-03-31T10:05	a1b2c3d	huashu-proofreading	78	84	keep	边界条件	补充fallback	full_test
-2026-03-31T10:10	b2c3d4e	huashu-proofreading	84	82	revert	指令具体性	过度细化	dry_run
+2026-03-31T10:10	b2c3d4e	huashu-proofreading	84	82	revert	指令具体性	reject:dim5 via 过度细化 Δ-2	dry_run
+2026-03-31T10:15	c3d4e5f	huashu-proofreading	84	85	revert	整体架构	regress:prompt2 via 重组段落 总分+1但实测退	full_test
 ```
 
 新增 `eval_mode` 列：`full_test`（跑了子agent测试）或 `dry_run`（模拟推演）。
+
+**`note` 列结构化前缀（供 P0 禁试清单 grep）**：`status=revert` 行的 note 必须用前缀——
+`reject:{dimN} via {方案摘要} Δ-{x}`（分数没涨）或 `regress:{prompt} via {方案} 总分+{x}但实测退`（P1-3 回归护栏触发）。
+Step 1 诊断时 grep 本 skill 的这些行 → 还原为「禁止重试清单」，避免重提同一烂招。
+
 文件位置：`.claude/skills/darwin-skill/results.tsv`
 
 ---
@@ -355,7 +389,7 @@ timestamp	commit	skill	old_score	new_score	status	dimension	note	eval_mode
 
 ## darwin 操作反例黑名单（dim9 应用：darwin 自己优化时不要做的事）
 
-来自本机 results.tsv 早期 40 次 0 revert 的教训 + Judge G/H 自指评估暴露的反模式。每条都是**真实踩过的坑**。
+来自本机 results.tsv 早期 40 次 0 revert 的教训 + Judge G/H 自指评估暴露的反模式（1-8 条是**真实踩过的坑**；9-10 条借鉴 SkillOpt 的失败记忆 / 双通道机制，详见「设计灵感」）。
 
 | # | 反模式 | 为什么不要做 | 替代做法 |
 |---|---|---|---|
@@ -367,6 +401,8 @@ timestamp	commit	skill	old_score	new_score	status	dimension	note	eval_mode
 | 6 | **dry_run 比例 > 30%** | dim8 实测维度形同虚设，分数虚高（早期 40 次记录 67% dry_run，0 revert） | 强制至少 1 个真实 full_test；dry_run 多的优化在 results.tsv 显式打 ⚠️ |
 | 7 | **静默跳过异常** | 遇到 git/tsv 异常时静默继续，破坏 ratchet 完整性 | 异常表 10 条 fallback 必须先告知用户再处理 |
 | 8 | **忽视维度相关性单独优化** | dim2/3/4 是相关簇，单独优化 dim2 时常发现已被前轮 dim3 修复推到顶 | 找最低维度时同时看相关簇短板，决定是否同步改 |
+| 9 | **revert 后不带走失败教训** | 失败方案没记录，下轮/下个 skill 重提同一烂招（SkillLens 实证 LLM 46.4% 乐观偏差易复发）| revert 时把 `reject:{维度} via {方案} Δ-{x}` 写进 results.tsv `note`，Step 1 诊断前读为禁试清单 |
+| 10 | **只盯最低维、不护已过维** | 拆东墙补西墙：加权总分涨了，但某个原本跑赢 baseline 的 test-prompt 悄悄退步 | full_test 下设回归护栏，之前 PASS、现在 FAIL → 即使总分涨也 revert |
 
 **触发场景**：每轮 Phase 2 改动前对照本表一次。任一反模式命中 → 改方案重写。
 
@@ -427,6 +463,14 @@ timestamp	commit	skill	old_score	new_score	status	dimension	note	eval_mode
 - **test set** → 每个skill的test-prompts.json
 
 区别：增加了人在回路（autoresearch是全自主的，skill优化需要人的判断力），以及双重评估机制（结构+效果），因为skill的「好坏」比loss数值更微妙。
+
+### 借鉴 SkillOpt（arXiv 2605.23904）
+
+两个机制从 Microsoft `microsoft/SkillOpt` 移植（保持诚实归因，不照搬其 NN 训练词汇/数值 LR）：
+- **P0 失败记忆缓冲区** ← `trainer.py` 的 step_buffer / rejected_edits：revert 时把失败方案记进 results.tsv `note`，下轮诊断前读为禁试清单（黑名单 #9）。直接对冲 SkillLens 实证的 LLM 46.4% 乐观偏差。
+- **P1-3 失败/成功双通道诊断** ← `gradient/reflect.py` 的 success/error 双通道：诊断不只补最低维，也保护已跑赢 baseline 的 test-prompt；full_test 下设回归护栏（黑名单 #10）。
+
+> 刻意**未**借鉴 SkillOpt 的 epoch/batch、benchmark 硬分、autonomous-LR、Gradio WebUI——darwin 是人在回路的 Markdown skill，无对应数据规模/客观奖励，硬搬即 cargo cult。
 
 ---
 
